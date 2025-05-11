@@ -1,0 +1,262 @@
+clc;
+clear all;
+close all;
+%% =========================================================================
+%% 读取数据部分
+numADCSamples = 256; %每个chirp是ADC样本数         number of ADC samples per chirp
+numADCBits = 16;     %每个样本的ADC位数            number of ADC bits per sample
+numRX = 4;           %接收器的数量                 number of receivers
+numLanes = 2;        %数据通道数量，总是2           do not change. number of lanes is always 2
+isReal = 0;          %设置为1表示只有实数数据，0表示复数数据    set to 1 if real only data, 0 if complex data0
+chirpLoop = 2;
+
+%% 雷达参数设置
+%一帧2个chrip，每个chirp 在adc采样时有 200个采样点，共1024帧，帧周期50ms，共51.2s
+Fs=1e7;             %ADC采样率 
+c=3*1e8;            %光速
+ts=numADCSamples/Fs;%ADC采样时间
+slope=70.006e12;        %调频斜率 
+B_valid =ts*slope;  %有效带宽
+detaR=c/(2*B_valid);%距离分辨率
+%C:\ti\mmwave_studio_02_01_01_00\mmWaveStudio\PostProc\adc_data.bin
+%% 读取Bin文件
+Filename = ['200Hz_256ADCNum_0.2m_Pos6_10mmm_1.bin'];  %文件名 
+fid = fopen(Filename,'r');           %打开文件，以只读模式打开指定的文件，并返回文件标识符 fid，用于后续的文件操作。
+adcDataRow = fread(fid, 'int16');    %读取数据，从打开的文件中读取所有数据，并将其解释为 16 位有符号整数，存储在 adcDataRow 向量中
+%数据处理（处理 ADC 数据，使其与实际的 ADC 分辨率相匹配）
+if numADCBits ~= 16                  %如果 numADCBits 不是 16
+    l_max = 2^(numADCBits-1)-1;      %计算最大可能的正值 l_max，它是 2^(numADCBits-1) - 1
+    adcDataRow(adcDataRow > l_max) = adcDataRow(adcDataRow > l_max) - 2^numADCBits;  %将超过 l_max 的值进行调整，以处理溢出情况。超过 l_max 的值被认为是负值，因此需要减去 2^numADCBits 以恢复到正确的范围内
+    %16bit的ADC，最高表示数据为[-32768，32767]，即[-2^15,2^15]，
+    % 剩下的1位的符号位，程序中数值高于32767的都要减去65536。
+end
+fclose(fid);                         %关闭之前打开的文件，释放文件标识符
+%% 数据处理 （计算并调整文件大小，使其符合预期数据格式。）
+fileSize = size(adcDataRow, 1);
+PRTnum = fix(fileSize/(numADCSamples*numRX));
+fileSize = PRTnum * numADCSamples*numRX;
+adcData = adcDataRow(1:fileSize);
+% real data reshape, filesize = numADCSamples*numChirps
+%复数数据处理（数据是否为复数，进行不同的数据重组）
+if isReal
+    numChirps = fileSize/numADCSamples/numRX;
+    LVDS = zeros(1, fileSize);
+    %create column for each chirp
+    LVDS = reshape(adcData, numADCSamples*numRX, numChirps);
+    %each r4ow is data from one chirp
+    LVDS = LVDS.';
+else
+    numChirps = fileSize/2/numADCSamples/numRX;     %含有实部虚部除以2
+    LVDS = zeros(1, fileSize/2);
+    %combine real and imaginary part into complex data将实部虚部结合成复数
+    %read in file: 2I is followed by 2Q    adcData数据组成:两个实部，接着是两个虚部
+    counter = 1;
+    for i=1:4:fileSize-1
+        LVDS(1,counter) = adcData(i) + sqrt(-1)*adcData(i+2);        %复数形式
+        LVDS(1,counter+1) = adcData(i+1)+sqrt(-1)*adcData(i+3); counter = counter + 2;
+    end
+    % create column for each chirp：每一列为chirp
+    LVDS = reshape(LVDS, numADCSamples*numRX, numChirps);
+    %each row is data from one chirp：每一行为chirp
+    LVDS = LVDS.';
+end
+
+%% 重组数据（重组的数据按照接收天线的数量进行存储）
+adcData = zeros(numRX,numChirps*numADCSamples);
+for row = 1:numRX
+    for i = 1: numChirps
+        adcData(row, (i-1)*numADCSamples+1:i*numADCSamples) = LVDS(i, (row-1)*numADCSamples+1:row*numADCSamples);
+    end
+end
+%取特定天线数据，重组数据retVal：200*2048矩阵，每一列为一个chirp
+retVal= reshape(adcData(1, :), numADCSamples, numChirps); %取第二个接收天线数据，数据存储方式为一个chirp一列
+
+process_adc=zeros(numADCSamples,numChirps/2);%每帧中的两个chrip取第一个，200*1024
+
+for nchirp = 1:2:numChirps  %1T4R （1T1R）只处理单发单收的数据，并且只处理两个chrip取出的第一个
+    process_adc(:, (nchirp-1)/2+1) = retVal(:,nchirp);
+end
+%% =============经过以上处理获得了最为关键的等待信号算法处理的数据：process_adc（200*2400矩阵）==============	
+%% 距离维FFT（1个chirp)（距离维数据进行FFT变换并绘制结果）
+figure;
+plot((0:numADCSamples-1)*detaR,db(abs(fft(process_adc(:,1)))));
+xlabel('距离（m）');
+ylabel('幅度(dB)');
+title('距离维FFT（1个chirp）');
+
+
+[X,Y] = meshgrid((0:numADCSamples-1)*detaR,(1:numChirps/2));   
+%三维矩阵显示
+
+fft1d= zeros(numChirps/2,numADCSamples);
+
+    for chirp_fft=1:numChirps/2
+        fft1d(chirp_fft,:) = abs(fft((process_adc(:,chirp_fft))));%
+    end
+
+figure;
+  mesh(X,Y,fft1d);
+xlabel('距离(m)');
+ylabel('脉冲chrip数');
+zlabel('幅度');
+title('距离维-1DFFT结果');
+
+%% 相位解缠绕部分
+RangFFT = 256;
+fft_data_last = zeros(1,RangFFT);  %能量幅值积累
+range_max = 0;
+adcdata = process_adc;
+numChirps = size(adcdata, 2);%1024chrip          numChirps变为1024
+
+%% 距离维FFT
+fft_data = fft(adcdata,RangFFT); 
+fft_data = fft_data.';%非共轭翻转1024*256
+
+for ii=1:numChirps-1                % 滑动对消，少了一个脉冲
+     fft_data(ii,:) = fft_data(ii+1,:)-fft_data(ii,:);
+end
+
+fft_data_abs = abs(fft_data);
+
+ % fft_data_abs(:,1:10)=0; %去除直流分量
+
+%实虚部分离（为了提取rangebin的相位）
+real_data = real(fft_data);%实部
+imag_data = imag(fft_data);%虚部
+
+
+for i = 1:numChirps
+    for j = 1:RangFFT  %对每一个距离点取相位 extract phase
+        angle_fft(i,j) = atan2(imag_data(i, j),real_data(i, j));
+    end
+end
+
+% Range-bin tracking 找出能量最大的点，即人体的位置  
+for j = 1:RangFFT
+    if(((j-1)*detaR)<0.5 &&((j-1)*detaR)>0.1) % 限定检测距离0.5-1m
+        for i = 1:numChirps % 进行非相干积累
+            fft_data_last(j) = fft_data_last(j) + fft_data_abs(i,j);%通过FFT后的多普勒信号的幅值进行定位
+        end
+        
+        if ( fft_data_last(j) > range_max)
+            range_max = fft_data_last(j);
+            max_num = j;  %最大能量序列号（range bin）maxnum
+        end
+    end
+end 
+
+%% 取出能量最大点的相位  extract phase from selected range bin
+angle_fft_last = angle_fft(:,max_num);
+% 提取相位信号（原始）
+figure;
+plot(angle_fft_last);
+xlabel('时间/点数（N）：对应每个chrip');
+ylabel('相位');
+title('未展开相位信号');
+phi=angle_fft_last;
+%% 脉冲噪声去除：滑动平均滤波（选取 0.25 s 的滑动窗口，窗口长度为5）
+%   去除由于测试环境引起的脉冲噪声
+phi=smoothdata(angle_fft_last,'movmean',5);
+figure;
+plot(phi);
+title('滑动平均滤波相位信号');
+%对相位信号作FFT 
+N1=length(phi);
+ FS=200;
+FFT = abs(fft(phi));              %--FFT                         取模，幅度
+f=(0:N1-1)*(FS/N1);             %其中每点的频率
+%傅里叶变换结果对称
+figure;
+plot(f(1:N1/2),FFT(1:N1/2)) %取前一部分放大观察
+xlabel('频率（f/Hz）');
+ylabel('幅度');
+
+% %% 进行相位解缠  phase unwrapping(手动解)，自动解可以采用MATLAB自带的函数unwrap()
+% %或称为相位解卷绕，由于相位值在 [ − π ,π ] 之间，而我们需要相位展开以获取实际的位移曲线，
+% % 因此每当连续值之间的相位差大于或者小于±π时，通过从相位中减去2π来获得相位展开。
+% n = 1;
+% for i = 1+1:numChirps
+%     diff = angle_fft_last(i) - angle_fft_last(i-1);
+%     if diff > pi
+%         angle_fft_last(i:end) = angle_fft_last(i:end) - 2*pi;
+%         n = n + 1;
+%     elseif diff < -pi
+%         angle_fft_last(i:end) = angle_fft_last(i:end) + 2*pi;  
+%     end
+% end
+% figure;
+% plot(angle_fft_last);
+% xlabel('时间/点数（N）：对应每个chirp');
+% ylabel('相位');
+% title('相位解缠  phase unwrapping后的结果');
+% % phi=angle_fft_last;
+% 
+% %% phase difference 相位差分后的数据
+% %通过减去连续的相位值，对展开的相位执行相位差运算，
+% % 这将有利于        ：增强心跳信号并消除硬件接收机存在的相位漂移，抑制呼吸信号及其谐波
+% angle_fft_last2=zeros(1,numChirps);
+% for i = 1:numChirps-1
+%     angle_fft_last2(i) = angle_fft_last(i+1) - angle_fft_last(i);
+%     angle_fft_last2(numChirps)=angle_fft_last(numChirps)-angle_fft_last(numChirps-1);
+% end 
+% % 方法：相位差分是通过不断将当前采样点展开相位与前一采样点做差实现
+% figure;
+% plot(angle_fft_last2);
+% xlabel('点数（N）');
+% ylabel('相位');
+% title('相位差分后的结果');
+% 
+% %% 脉冲噪声去除：滑动平均滤波（选取 0.05 s 的滑动窗口，窗口长度为5）
+% %   去除由于测试环境引起的脉冲噪声
+% phi=smoothdata(angle_fft_last2,'movmean',5);
+% figure;
+% plot(phi);
+% title('滑动平均滤波相位信号');
+% %% 对相位信号作FFT 
+% N1=length(phi);
+% FS=100;
+% FFT = abs(fft(phi));              %--FFT                         取模，幅度
+% f=(0:N1-1)*(FS/N1);             %其中每点的频率
+% %傅里叶变换结果对称
+% figure;
+% plot(f(1:N1/2),FFT(1:N1/2)) %取前一部分放大观察
+% xlabel('频率（f/Hz）');
+% ylabel('幅度');
+% title('相位信号FFT  ');
+
+%% 小波变换
+sig=phi;
+N=length(sig);
+f=200;
+t=((0:N-1)*2/f)';
+% f=(0:N1-1)*(FS/N1);             %其中每点的频率
+%t=((0:1024-1)*1/Fs)';
+
+% %% 数据导入
+% SIG=readmatrix('test.xlsx');
+% sig=SIG(:,2);%%想要分解哪一列就填几
+% %(1)导入时间数据来设置时间
+% t=SIG(:,1);Fs=1/(t(2)-t(1));
+% %(2)设置采样率来设置时间
+% % N=length(sig);
+% % Fs=1000;%%采样频率自己设置
+% % t1=((0:N-1)*1/Fs)';
+% %% 加入噪声（不需要可注释掉）
+% SNR=5;rng(10)
+% sig = awgn(sig,SNR,'measured');       %添加噪声
+ 
+
+% 进行连续小波变换（CWT）
+% 这里可以选择你希望使用的小波函数，例如 'mexh'（墨西哥帽小波）morse/bump/amor
+[wt, f] = cwt(sig, 'bump',f);  % wt 是小波变换的系数，f 是频率向量
+% [wt, f] = cwt(sig, 'mexh',f);  % wt 是小波变换的系数，f 是频率向量
+
+% 可视化小波变换结果
+figure;
+surf(t, f, abs(wt));  % 绘制CWT结果的幅度图
+shading interp;  % 平滑显示
+xlabel('时间 (秒)');
+ylabel('频率 (Hz)');
+zlabel('幅值');
+title('连续小波变换的三维图');
+colorbar;  % 显示颜色条（幅值）
